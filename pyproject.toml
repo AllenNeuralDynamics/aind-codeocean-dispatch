@@ -1,0 +1,88 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aind-codeocean-dispatch"
+description = "Launch, monitor, and capture batches of Code Ocean capsule runs"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+  { name = "Allen Institute for Neural Dynamics" },
+  { name = "Galen Lynch", email = "galen@galenlynch.com" },
+]
+classifiers = ["Programming Language :: Python :: 3"]
+readme = "README.md"
+version = "0.1.0"
+
+dependencies = [
+    "aind-code-ocean-pipeline-utils>=0.7.1",
+    "codeocean>=0.17",
+]
+
+[project.urls]
+Repository = "https://github.com/AllenNeuralDynamics/aind-codeocean-dispatch/"
+Issues = "https://github.com/AllenNeuralDynamics/aind-codeocean-dispatch/issues"
+Changelog = "https://github.com/AllenNeuralDynamics/aind-codeocean-dispatch/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+types = ["mypy"]
+dev = [{ include-group = "types" }, "codespell", "pytest", "pytest-cov", "ruff", "interrogate"]
+jupyter = [{ include-group = "dev" }, "ipykernel", "pip"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aind_codeocean_dispatch"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["scratch"]
+
+[tool.ruff.lint]
+extend-select = ["Q", "RUF100", "C90", "I", "F", "E", "W", "D", "UP", "ANN", "PYI"]
+extend-ignore = ["ANN401"]  # Skip self/cls type annotations
+per-file-ignores = { "tests/*.py" = ["ANN", "D"] }
+mccabe = { max-complexity = 14 }
+pydocstyle = { convention = "numpy" }
+
+[tool.codespell]
+skip = ".git,*.pdf,*.svg,./docs/build,uv.lock,scratch"
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --tb=short --cov=src --cov-report=term-missing --cov-fail-under=0"
+testpaths = ["tests"]
+
+[tool.interrogate]
+ignore-init-method = true
+ignore-magic = true
+ignore_module = true
+fail-under = 30
+exclude = [
+  "__init__.py",
+  "tests",
+  "docs",
+  "build",
+  "examples",
+  "site",
+  "scratch",
+  ".venv",
+]
+
+[tool.commitizen]
+version_provider = "pep621"
+update_changelog_on_bump = true
+tag_format = "v$version"
+major_version_zero = true
+
+
+[tool.mypy]
+files = ["src/aind_codeocean_dispatch"]
+strict = true
+show_error_codes = true
+exclude = ["scratch"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
