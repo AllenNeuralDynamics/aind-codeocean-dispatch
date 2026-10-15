@@ -17,7 +17,7 @@ version = "0.2.0"
 
 dependencies = [
     "aind-code-ocean-pipeline-utils>=0.7.1",
-    "codeocean>=0.17",
+    "codeocean>=0.13",
 ]
 
 [project.urls]

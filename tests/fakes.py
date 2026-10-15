@@ -8,14 +8,14 @@ creation order.
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 from dataclasses import dataclass, field
 from typing import Any
 
 import requests
-from codeocean.error import Error as CodeOceanError
-from codeocean.models.computation import Computation, ComputationEndStatus, ComputationState, RunParams
-from codeocean.models.data_asset import (
+from codeocean.computation import Computation, ComputationEndStatus, ComputationState, RunParams
+from codeocean.data_asset import (
     DataAsset,
     DataAssetParams,
     DataAssetSearchParams,
@@ -23,6 +23,16 @@ from codeocean.models.data_asset import (
     DataAssetState,
     DataAssetType,
 )
+from codeocean.error import Error as CodeOceanError
+
+
+def build(cls: Any, **values: Any) -> Any:
+    """Construct an SDK model, dropping fields this SDK version does not declare.
+
+    Required fields differ across supported versions (0.17 added ``owner``).
+    """
+    declared = {f.name for f in dataclasses.fields(cls)}
+    return cls(**{name: value for name, value in values.items() if name in declared})
 
 
 class FakeClock:
@@ -69,7 +79,8 @@ CRASHED = snapshot(ComputationState.Completed, end_status=ComputationEndStatus.F
 
 
 def asset(asset_id: str, state: DataAssetState, *, tags: list[str] | None = None, created: int = 0) -> DataAsset:
-    return DataAsset(
+    return build(
+        DataAsset,
         id=asset_id,
         created=created,
         name=asset_id,
@@ -115,7 +126,7 @@ class FakeComputations:
 
     @staticmethod
     def _computation(computation_id: str, step: dict[str, Any]) -> Computation:
-        return Computation(id=computation_id, created=0, name=computation_id, owner="owner", run_time=0, **step)
+        return build(Computation, id=computation_id, created=0, name=computation_id, owner="owner", run_time=0, **step)
 
 
 @dataclass
@@ -125,7 +136,7 @@ class FakeDataAssets:
     existing: list[DataAsset] = field(default_factory=list)
     search_errors: list[Exception] = field(default_factory=list)
     created: list[DataAssetParams] = field(default_factory=list)
-    searches: list[str] = field(default_factory=list)
+    searches: list[DataAssetSearchParams] = field(default_factory=list)
     _scripts: dict[str, list[Any]] = field(default_factory=dict)
 
     def create_data_asset(self, data_asset_params: DataAssetParams) -> DataAsset:
@@ -145,7 +156,7 @@ class FakeDataAssets:
         return asset(data_asset_id, step)
 
     def search_data_assets(self, search_params: DataAssetSearchParams) -> DataAssetSearchResults:
-        self.searches.append(search_params.query)
+        self.searches.append(search_params)
         if self.search_errors:
             raise self.search_errors.pop(0)
         return DataAssetSearchResults(has_more=False, results=list(self.existing))

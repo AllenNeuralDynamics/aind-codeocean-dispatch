@@ -5,8 +5,9 @@ from typing import Any
 import pytest
 import requests
 from aind_code_ocean_pipeline_utils.process import GracefulExit
-from codeocean.models.computation import Computation, DataAssetsRunParam, NamedRunParam, RunParams
-from codeocean.models.data_asset import DataAssetParams, DataAssetState
+from codeocean.components import Ownership
+from codeocean.computation import Computation, DataAssetsRunParam, NamedRunParam, RunParams
+from codeocean.data_asset import DataAssetParams, DataAssetState
 
 from aind_codeocean_dispatch import (
     DispatchFailed,
@@ -255,6 +256,8 @@ def test_reuse_returns_newest_ready_asset_with_exact_tag(clock: FakeClock) -> No
     assert outcome.status == "reused"
     assert outcome.asset_id == "new"
     assert client.computations.launches == []
+    (search,) = client.data_assets.searches
+    assert search.ownership == Ownership.Created
 
 
 def test_reuse_launches_when_nothing_matches(clock: FakeClock) -> None:

@@ -33,9 +33,13 @@ from typing import TYPE_CHECKING, Any, Literal, TypeVar
 import requests
 from aind_code_ocean_pipeline_utils.cache import input_fingerprint
 from aind_code_ocean_pipeline_utils.process import GracefulExit, check_shutdown
+
+# Import paths that exist across supported SDK versions; 0.17 moved the models to
+# ``codeocean.models`` and kept these as re-exports.
+from codeocean.components import Ownership
+from codeocean.computation import Computation, ComputationEndStatus, ComputationState, RunParams
+from codeocean.data_asset import DataAsset, DataAssetParams, DataAssetSearchParams, DataAssetState
 from codeocean.error import Error as CodeOceanError
-from codeocean.models.computation import Computation, ComputationEndStatus, ComputationState, RunParams
-from codeocean.models.data_asset import DataAsset, DataAssetParams, DataAssetSearchParams, DataAssetState
 
 if TYPE_CHECKING:
     from codeocean import CodeOcean
@@ -88,8 +92,8 @@ class Job:
         can depend on it. ``None`` stops at a successful computation.
     key : str, optional
         Resume key (see :func:`job_key`), added to the captured asset as
-        :func:`key_tag`. With ``reuse=True``, a Ready asset carrying it is returned
-        instead of launching. ``None`` never reuses.
+        :func:`key_tag`. With ``reuse=True``, a Ready asset carrying it that the
+        caller created is returned instead of launching. ``None`` never reuses.
     """
 
     label: str
@@ -243,7 +247,9 @@ def run_jobs(
     capture_retries : int, optional
         New capture attempts per job after a capture ends in the Failed state.
     reuse : bool, optional
-        Return a Ready asset tagged with a job's key instead of launching it.
+        Return a Ready asset tagged with a job's key instead of launching it. Only
+        assets the caller created count: another user running identical inputs
+        produces the same key, and their asset is not the caller's to consume.
     poll_interval_s : float, optional
         Seconds between status checks of each running computation.
     timeout_s : float, optional
@@ -479,7 +485,7 @@ class _Dispatcher:
             if slot.next_at > _now():
                 continue
             tag = key_tag(slot.job.key)
-            params = DataAssetSearchParams(query=f"tag:{tag}", limit=100)
+            params = DataAssetSearchParams(query=f"tag:{tag}", ownership=Ownership.Created, limit=100)
             try:
                 results = self.client.data_assets.search_data_assets(params)
             except (CodeOceanError, requests.RequestException) as exc:

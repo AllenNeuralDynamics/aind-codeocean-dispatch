@@ -50,7 +50,7 @@ types = [
 [package.metadata]
 requires-dist = [
     { name = "aind-code-ocean-pipeline-utils", specifier = ">=0.7.1" },
-    { name = "codeocean", specifier = ">=0.17" },
+    { name = "codeocean", specifier = ">=0.13" },
 ]
 
 [package.metadata.requires-dev]
