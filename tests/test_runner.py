@@ -127,6 +127,7 @@ def test_failed_start_beyond_retries_fails_with_every_attempt(clock: FakeClock) 
     assert outcome.status == "failed"
     assert outcome.computation_ids == ("comp-0", "comp-1")
     assert "has_results=False" in (outcome.error or "")
+    assert (outcome.failure, outcome.transient) == ("failed_start", True)
 
 
 def test_failed_starts_back_off_and_hold_other_launches(clock: FakeClock) -> None:
@@ -168,6 +169,7 @@ def test_capsule_crash_is_not_relaunched(clock: FakeClock) -> None:
 
     assert [o.status for o in outcomes] == ["failed", "captured"]
     assert "exit_code=1" in (outcomes[0].error or "")
+    assert (outcomes[0].failure, outcomes[0].transient) == ("computation", False)
     assert len(client.computations.launches) == 2
 
 
@@ -193,6 +195,7 @@ def test_server_error_on_launch_is_not_retried(clock: FakeClock) -> None:
     assert outcome.status == "failed"
     assert "may have taken effect" in (outcome.error or "")
     assert client.computations.launches == []
+    assert (outcome.failure, outcome.transient) == ("api_unavailable", True)
 
 
 def test_transient_errors_on_status_checks_do_not_fail_a_running_job(clock: FakeClock) -> None:
@@ -211,6 +214,7 @@ def test_client_error_on_status_check_fails_the_job(clock: FakeClock) -> None:
     assert outcome.status == "failed"
     assert "status check failed" in (outcome.error or "")
     assert "may have taken effect" not in (outcome.error or "")
+    assert (outcome.failure, outcome.transient) == ("api_rejected", False)
 
 
 def test_rate_limited_capture_is_retried(clock: FakeClock) -> None:
@@ -262,6 +266,7 @@ def test_failed_capture_fails_the_job_by_default(clock: FakeClock) -> None:
 
     assert outcome.status == "failed"
     assert "capture asset-0" in (outcome.error or "")
+    assert (outcome.failure, outcome.transient) == ("capture", True)
 
 
 def test_timeout_fails_the_job_and_leaves_it_running(clock: FakeClock) -> None:
@@ -271,6 +276,83 @@ def test_timeout_fails_the_job_and_leaves_it_running(clock: FakeClock) -> None:
 
     assert outcome.status == "failed"
     assert "comp-0 left running" in (outcome.error or "")
+    assert (outcome.failure, outcome.transient) == ("timeout", False)
+
+
+# -- cancelling on failure ----------------------------------------------------
+
+
+def test_successful_outcomes_carry_no_failure(clock: FakeClock) -> None:
+    (outcome,) = run_jobs(make_client(clock, {"a": [[SUCCEEDED]]}), [job("a")])
+
+    assert (outcome.failure, outcome.transient, outcome.ok) == (None, False, True)
+
+
+def test_failure_cancels_running_and_pending_jobs(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[CRASHED]], "b": [[RUNNING]], "c": [[SUCCEEDED]]})
+
+    outcomes = run_jobs(client, [job("a"), job("b"), job("c")], max_in_flight=2, cancel_on_failure=True)
+
+    assert [o.status for o in outcomes] == ["failed", "cancelled", "cancelled"]
+    assert client.computations.deleted == ["comp-1"]
+    assert [capsule for _, capsule, _ in client.computations.launches] == ["a", "b"]
+    assert outcomes[1].computation_ids == ("comp-1",)
+    assert outcomes[2].computation_ids == ()
+    assert outcomes[1].error == "cancelled after a failed"
+    assert not outcomes[1].ok
+    assert outcomes[1].failure is None
+
+
+def test_capture_under_way_finishes_when_cancelling(clock: FakeClock) -> None:
+    client = make_client(
+        clock,
+        {"a": [[RUNNING, CRASHED]], "b": [[SUCCEEDED]]},
+        capture_states=[[DataAssetState.Draft] * 10 + [DataAssetState.Ready]],
+    )
+
+    outcomes = run_jobs(client, [job("a"), job("b")], cancel_on_failure=True)
+
+    assert [o.status for o in outcomes] == ["failed", "captured"]
+    assert client.computations.deleted == []
+
+
+def test_cancel_predicate_decides_per_failure(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[FAILED_START]], "b": [[RUNNING, SUCCEEDED]]})
+
+    outcomes = run_jobs(
+        client, [job("a"), job("b")], start_retries=0, cancel_on_failure=lambda outcome: not outcome.transient
+    )
+
+    assert [o.status for o in outcomes] == ["failed", "captured"]
+
+
+def test_failed_stop_is_reported_on_the_cancelled_job(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[CRASHED]], "b": [[RUNNING]]})
+    client.computations.delete_errors = [http_error(503)]
+
+    outcomes = run_jobs(client, [job("a"), job("b")], cancel_on_failure=True)
+
+    assert outcomes[1].status == "cancelled"
+    assert "could not stop computation comp-1" in (outcomes[1].error or "")
+
+
+def test_failures_continue_by_default(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[CRASHED]], "b": [[RUNNING, SUCCEEDED]]})
+
+    outcomes = run_jobs(client, [job("a"), job("b")])
+
+    assert [o.status for o in outcomes] == ["failed", "captured"]
+    assert client.computations.deleted == []
+
+
+def test_raise_for_failures_lists_cancelled_jobs(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[CRASHED]], "b": [[RUNNING]]})
+    outcomes = run_jobs(client, [job("a"), job("b")], cancel_on_failure=True)
+
+    with pytest.raises(DispatchFailed) as info:
+        raise_for_failures(outcomes)
+
+    assert [o.job.label for o in info.value.failures] == ["a", "b"]
 
 
 # -- reuse --------------------------------------------------------------------
@@ -343,6 +425,7 @@ def test_capture_callback_error_fails_only_that_job(clock: FakeClock) -> None:
     outcomes = run_jobs(client, jobs)
 
     assert [o.status for o in outcomes] == ["failed", "captured"]
+    assert outcomes[0].failure == "capture_callback"
 
 
 def test_duplicate_labels_are_rejected(clock: FakeClock) -> None:

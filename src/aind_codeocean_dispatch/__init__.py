@@ -5,8 +5,10 @@ from importlib.metadata import PackageNotFoundError, version
 from .capsule_git import capsule_head_commit, head_commit, run_owner_email
 from .capture import capture_as, capture_named_by_data_description, derived_name
 from .runner import (
+    TRANSIENT_FAILURES,
     DispatchFailed,
     DispatchInterrupted,
+    Failure,
     Job,
     Outcome,
     failed_without_results,
@@ -18,8 +20,10 @@ from .runner import (
 )
 
 __all__ = [
+    "TRANSIENT_FAILURES",
     "DispatchFailed",
     "DispatchInterrupted",
+    "Failure",
     "Job",
     "Outcome",
     "capsule_head_commit",

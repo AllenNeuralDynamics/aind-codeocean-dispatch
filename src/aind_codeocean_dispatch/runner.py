@@ -47,8 +47,10 @@ if TYPE_CHECKING:
     from codeocean import CodeOcean
 
 __all__ = [
+    "TRANSIENT_FAILURES",
     "DispatchFailed",
     "DispatchInterrupted",
+    "Failure",
     "Job",
     "Outcome",
     "failed_without_results",
@@ -75,7 +77,15 @@ _TRANSIENT_SERVER = frozenset({500, 502, 503, 504})
 _KEY_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _KEY_TAG_PREFIX = "dispatch-"
 
-Status = Literal["captured", "completed", "reused", "failed"]
+Status = Literal["captured", "completed", "reused", "failed", "cancelled"]
+#: Why a job failed. ``failed_start`` means the relaunch budget ran out;
+#: ``computation`` that it ran and failed; ``api_rejected`` a 4xx other than 429;
+#: ``api_unavailable`` a 5xx or connection error on a call that cannot be retried.
+Failure = Literal[
+    "failed_start", "computation", "timeout", "capture", "capture_callback", "api_rejected", "api_unavailable"
+]
+#: Failures on the platform's side, which a rerun of the same job can get past.
+TRANSIENT_FAILURES: frozenset[Failure] = frozenset({"failed_start", "capture", "api_unavailable"})
 _T = TypeVar("_T")
 
 
@@ -114,7 +124,8 @@ class Outcome:
     """How one job ended.
 
     ``computation_ids`` lists every launch attempt in order, so a relaunched job's
-    failed starts stay traceable.
+    failed starts stay traceable. ``failure`` is set only when ``status`` is
+    ``"failed"``.
     """
 
     job: Job
@@ -122,11 +133,17 @@ class Outcome:
     asset_id: str | None = None
     computation_ids: tuple[str, ...] = ()
     error: str | None = None
+    failure: Failure | None = None
 
     @property
     def ok(self) -> bool:
         """Whether the job produced what was asked of it."""
-        return self.status != "failed"
+        return self.status not in ("failed", "cancelled")
+
+    @property
+    def transient(self) -> bool:
+        """Whether the job failed for a platform reason a rerun can get past."""
+        return self.failure in TRANSIENT_FAILURES
 
 
 class DispatchFailed(RuntimeError):
@@ -229,11 +246,12 @@ def run_jobs(
     reuse: bool = False,
     poll_interval_s: float = 60.0,
     timeout_s: float | None = None,
+    cancel_on_failure: bool | Callable[[Outcome], bool] = False,
 ) -> list[Outcome]:
     """Launch *jobs*, wait for each, capture its results, and report every outcome.
 
-    A job's failure never stops the others or raises; check the outcomes, or pass them
-    to :func:`raise_for_failures`.
+    A job's failure never raises; check the outcomes, or pass them to
+    :func:`raise_for_failures`.
 
     Parameters
     ----------
@@ -266,6 +284,10 @@ def run_jobs(
     timeout_s : float, optional
         Give up waiting on an attempt after this long. The computation is left
         running, not stopped. ``None`` waits indefinitely.
+    cancel_on_failure : bool or callable, optional
+        Whether a failed job cancels the rest, or a predicate on its outcome. On
+        cancel, pending jobs are not launched and running computations are stopped
+        and deleted, all ending ``"cancelled"``; captures already under way finish.
 
     Returns
     -------
@@ -299,6 +321,7 @@ def run_jobs(
         reuse=reuse,
         poll_interval_s=poll_interval_s,
         timeout_s=timeout_s,
+        cancel_on_failure=cancel_on_failure,
     ).run()
 
 
@@ -417,6 +440,7 @@ class _Dispatcher:
         reuse: bool,
         poll_interval_s: float,
         timeout_s: float | None,
+        cancel_on_failure: bool | Callable[[Outcome], bool],
     ) -> None:
         self.client = client
         self.slots = [_Slot(job) for job in jobs]
@@ -429,6 +453,8 @@ class _Dispatcher:
         self.reuse = reuse
         self.poll_interval_s = poll_interval_s
         self.timeout_s = timeout_s
+        self.cancel_on_failure = cancel_on_failure
+        self.cancelled_by: str | None = None
         self.next_launch_at = 0.0
 
     def run(self) -> list[Outcome]:
@@ -477,7 +503,7 @@ class _Dispatcher:
             return
         _sleep(min(_MAX_SLEEP_S, min(due) - now))
 
-    def _finish(self, slot: _Slot, status: Status, *, error: str | None = None) -> None:
+    def _finish(self, slot: _Slot, status: Status, *, error: str | None = None, failure: Failure | None = None) -> None:
         slot.phase = _Phase.DONE
         slot.outcome = Outcome(
             job=slot.job,
@@ -485,11 +511,36 @@ class _Dispatcher:
             asset_id=slot.asset_id,
             computation_ids=tuple(slot.computation_ids),
             error=error,
+            failure=failure,
         )
         if error is None:
             logger.info("%s: %s", slot.job.label, status)
         else:
-            logger.error("%s: failed: %s", slot.job.label, error)
+            logger.error("%s: %s: %s", slot.job.label, status, error)
+        if status == "failed" and self.cancelled_by is None and self._should_cancel(slot.outcome):
+            self._cancel_rest(slot.job.label)
+
+    def _should_cancel(self, outcome: Outcome) -> bool:
+        if callable(self.cancel_on_failure):
+            return self.cancel_on_failure(outcome)
+        return self.cancel_on_failure
+
+    def _cancel_rest(self, failed_label: str) -> None:
+        """Stop every job not yet past its computation; captures under way finish."""
+        self.cancelled_by = failed_label
+        to_cancel = [slot for slot in self.slots if slot.phase in (_Phase.PENDING, _Phase.RUNNING)]
+        if to_cancel:
+            logger.warning("%s failed; cancelling %d other job(s)", failed_label, len(to_cancel))
+        for slot in to_cancel:
+            error = f"cancelled after {failed_label} failed"
+            if slot.phase is _Phase.RUNNING:
+                computation_id = slot.computation_ids[-1]
+                try:
+                    # Code Ocean has no stop call; deleting stops a running computation.
+                    self.client.computations.delete_computation(computation_id)
+                except (CodeOceanError, requests.RequestException) as exc:
+                    error += f"; could not stop computation {computation_id}: {exc}"
+            self._finish(slot, "cancelled", error=error)
 
     def _call(self, slot: _Slot, what: str, fn: Callable[[], _T], *, idempotent: bool) -> _T | None:
         """Run one API call for *slot*; on error, schedule a retry or fail the job.
@@ -502,8 +553,14 @@ class _Dispatcher:
         except (CodeOceanError, requests.RequestException) as exc:
             delay = _retry_delay(exc, slot.api_errors, idempotent=idempotent)
             if delay is None:
-                note = " It may have taken effect anyway; check before rerunning." if _is_ambiguous(exc) else ""
-                self._finish(slot, "failed", error=f"{what} failed: {exc}.{note}")
+                ambiguous = _is_ambiguous(exc)
+                note = " It may have taken effect anyway; check before rerunning." if ambiguous else ""
+                self._finish(
+                    slot,
+                    "failed",
+                    error=f"{what} failed: {exc}.{note}",
+                    failure="api_unavailable" if ambiguous else "api_rejected",
+                )
                 return None
             slot.api_errors += 1
             slot.next_at = _now() + delay
@@ -577,6 +634,7 @@ class _Dispatcher:
                     slot,
                     "failed",
                     error=f"timed out after {self.timeout_s:.0f} s; computation {computation_id} left running",
+                    failure="timeout",
                 )
             else:
                 slot.next_at = _now() + self.poll_interval_s
@@ -594,7 +652,8 @@ class _Dispatcher:
             self.next_launch_at = max(self.next_launch_at, slot.next_at)
             logger.warning("%s: %s; relaunching in %.0f s", slot.job.label, _describe(computation), backoff_s)
         else:
-            self._finish(slot, "failed", error=_describe(computation))
+            failure: Failure = "failed_start" if self.is_failed_start(computation) else "computation"
+            self._finish(slot, "failed", error=_describe(computation), failure=failure)
 
     def _start_capture(self, slot: _Slot, computation: Computation) -> None:
         assert slot.job.capture is not None
@@ -603,7 +662,12 @@ class _Dispatcher:
         # Broad on purpose: one job's bad callback must not orphan the others' computations.
         except Exception as exc:
             logger.exception("%s: capture callback raised", slot.job.label)
-            self._finish(slot, "failed", error=f"capture callback raised for computation {computation.id}: {exc!r}")
+            self._finish(
+                slot,
+                "failed",
+                error=f"capture callback raised for computation {computation.id}: {exc!r}",
+                failure="capture_callback",
+            )
             return
         if slot.job.key is not None and key_tag(slot.job.key) not in params.tags:
             params = dataclasses.replace(params, tags=[*params.tags, key_tag(slot.job.key)])
@@ -644,7 +708,10 @@ class _Dispatcher:
                 logger.warning("%s: capture %s failed; capturing again", slot.job.label, asset_id)
             else:
                 self._finish(
-                    slot, "failed", error=f"capture {asset_id} of computation {slot.computation_ids[-1]} failed"
+                    slot,
+                    "failed",
+                    error=f"capture {asset_id} of computation {slot.computation_ids[-1]} failed",
+                    failure="capture",
                 )
         else:
             slot.next_at = _now() + _ASSET_POLL_S

@@ -104,6 +104,8 @@ class FakeComputations:
     launch_errors: dict[str, list[Exception]] = field(default_factory=dict)
     launches: list[tuple[float, str, str]] = field(default_factory=list)  # (time, capsule_id, computation_id)
     max_running: int = 0
+    deleted: list[str] = field(default_factory=list)
+    delete_errors: list[Exception] = field(default_factory=list)
     _ids: itertools.count[int] = field(default_factory=itertools.count)
     _scripts: dict[str, list[Any]] = field(default_factory=dict)
     _running: set[str] = field(default_factory=set)
@@ -118,6 +120,12 @@ class FakeComputations:
         self._running.add(computation_id)
         self.max_running = max(self.max_running, len(self._running))
         return self._computation(computation_id, snapshot(ComputationState.Initializing))
+
+    def delete_computation(self, computation_id: str) -> None:
+        if self.delete_errors:
+            raise self.delete_errors.pop(0)
+        self.deleted.append(computation_id)
+        self._running.discard(computation_id)
 
     def get_computation(self, computation_id: str) -> Computation:
         script = self._scripts[computation_id]
