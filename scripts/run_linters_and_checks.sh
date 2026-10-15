@@ -41,24 +41,36 @@ main() {
     run() { uv run $UV_ARGS -- "$@"; }
   fi
 
-  echo "+ ruff format"
-  run ruff format
+  # Every step runs even after a failure so one pass reports all problems;
+  # the exit status is nonzero if any step failed.
+  FAILED=""
+  step() {
+    name="$1"
+    shift
+    echo "+ $name"
+    run "$@" || FAILED="$FAILED
+  $name"
+  }
+
+  step "ruff format" ruff format
 
   if [ "$CHECKS" = true ]; then
-    echo "+ ruff check"
-    run ruff check
-    echo "+ mypy"
-    run mypy
-    echo "+ interrogate -v src"
-    run interrogate -v src
-    echo "+ codespell --check-filenames"
-    run codespell --check-filenames
-    echo "+ pytest --cov aind_codeocean_dispatch$([ -n "$PYTEST_ARGS" ] && printf ' -- %s' "$PYTEST_ARGS")"
+    step "ruff check" ruff check
+    step "mypy" mypy
+    step "interrogate -v src" interrogate -v src
+    step "codespell --check-filenames" codespell --check-filenames
     # shellcheck disable=SC2086
-    run pytest --cov aind_codeocean_dispatch $PYTEST_ARGS
+    step "pytest --cov aind_codeocean_dispatch$([ -n "$PYTEST_ARGS" ] && printf ' -- %s' "$PYTEST_ARGS")" \
+      pytest --cov aind_codeocean_dispatch $PYTEST_ARGS
   else
     echo "(checks skipped; pass -c or --checks to enable)"
   fi
+
+  if [ -n "$FAILED" ]; then
+    echo "FAILED:$FAILED" >&2
+    return 1
+  fi
+  echo "All steps passed."
 }
 
 main "$@"
