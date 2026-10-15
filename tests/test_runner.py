@@ -24,6 +24,7 @@ from aind_codeocean_dispatch import (
 from tests.fakes import (
     CRASHED,
     FAILED_START,
+    FAILED_STATE_START,
     RUNNING,
     SUCCEEDED,
     FakeClient,
@@ -102,6 +103,15 @@ def test_key_tag_is_added_to_capture(clock: FakeClock) -> None:
 
 def test_failed_start_is_relaunched_once_by_default(clock: FakeClock) -> None:
     client = make_client(clock, {"a": [[FAILED_START], [SUCCEEDED]]})
+
+    (outcome,) = run_jobs(client, [job("a")])
+
+    assert outcome.status == "captured"
+    assert outcome.computation_ids == ("comp-0", "comp-1")
+
+
+def test_failed_start_reported_as_failed_state_is_relaunched(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[FAILED_STATE_START], [SUCCEEDED]]})
 
     (outcome,) = run_jobs(client, [job("a")])
 

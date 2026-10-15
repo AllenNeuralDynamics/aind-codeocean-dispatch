@@ -172,10 +172,13 @@ def succeeded(computation: Computation) -> bool:
 def failed_without_results(computation: Computation) -> bool:
     """Whether a computation looks like it never started: failed, with no results.
 
-    A capsule that crashes before writing anything matches too, so a relaunch can be
-    spent on a real bug; ``start_retries`` bounds that cost.
+    Code Ocean reports a failed start as ``state=Completed`` with
+    ``end_status=Failed``, ``exit_code=0`` and no results, so this keys on
+    ``end_status``, not ``state``. A capsule that crashes before writing anything
+    can match too, so a relaunch can be spent on a real bug; ``start_retries``
+    bounds that cost.
     """
-    return computation.state == ComputationState.Failed and not computation.has_results
+    return computation.end_status == ComputationEndStatus.Failed and not computation.has_results
 
 
 def key_tag(key: str) -> str:

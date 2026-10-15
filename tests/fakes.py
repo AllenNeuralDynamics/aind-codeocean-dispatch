@@ -74,7 +74,11 @@ RUNNING = snapshot(ComputationState.Running)
 SUCCEEDED = snapshot(
     ComputationState.Completed, end_status=ComputationEndStatus.Succeeded, exit_code=0, has_results=True
 )
-FAILED_START = snapshot(ComputationState.Failed, end_status=ComputationEndStatus.Failed, has_results=False)
+# The shape Code Ocean reports for a run that never started.
+FAILED_START = snapshot(
+    ComputationState.Completed, end_status=ComputationEndStatus.Failed, exit_code=0, has_results=False
+)
+FAILED_STATE_START = snapshot(ComputationState.Failed, end_status=ComputationEndStatus.Failed, has_results=False)
 CRASHED = snapshot(ComputationState.Completed, end_status=ComputationEndStatus.Failed, exit_code=1, has_results=True)
 
 
