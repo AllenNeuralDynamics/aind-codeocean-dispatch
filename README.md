@@ -24,14 +24,9 @@ Otherwise, you can use pip:
 pip install aind-codeocean-dispatch
 ```
 
+## Usage
 
-
-To develop the code, run:
-```bash
-uv sync
-```
-
-## Capturing runs from a post-run automation
+### Capturing runs from a post-run automation
 
 A Code Ocean pipeline can name an automation capsule that runs after every run. A capsule
 whose `code/run` is
@@ -48,25 +43,9 @@ input asset. It needs only `CODEOCEAN_TOKEN`; `CAPTURE_TAGS`, `CAPTURE_FAILED` a
 `CAPTURE_PERMISSIONS` adjust it. It registers nothing in DocDB and writes no external
 bucket, so pipelines that publish use `asset-creation-capsule` instead.
 
-## Development
+## Contributing
 
-Please test your changes using the full linting and testing suite:
-
-```bash
-./scripts/run_linters_and_checks.sh -c
-```
-
-Or run individual commands:
-```bash
-uv run --frozen ruff format          # Code formatting
-uv run --frozen ruff check           # Linting
-uv run --frozen mypy                 # Type checking
-uv run --frozen interrogate -v src   # Documentation coverage
-uv run --frozen codespell --check-filenames  # Spell checking
-uv run --frozen pytest --cov aind_codeocean_dispatch # Tests with coverage
-```
-
-
+Setup, checks, tests and conventions are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
