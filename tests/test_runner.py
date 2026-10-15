@@ -5,9 +5,11 @@ from typing import Any
 import pytest
 import requests
 from aind_code_ocean_pipeline_utils.process import GracefulExit
+from codeocean import CodeOcean
 from codeocean.components import Ownership
 from codeocean.computation import Computation, DataAssetsRunParam, NamedRunParam, RunParams
 from codeocean.data_asset import DataAssetParams, DataAssetState
+from urllib3.util import Retry
 
 from aind_codeocean_dispatch import (
     DispatchFailed,
@@ -313,6 +315,33 @@ def test_capture_callback_error_fails_only_that_job(clock: FakeClock) -> None:
 def test_duplicate_labels_are_rejected(clock: FakeClock) -> None:
     with pytest.raises(ValueError, match="unique"):
         run_jobs(make_client(clock, {}), [job("a"), job("a")])
+
+
+@pytest.mark.parametrize("retries", [3, Retry(total=5, allowed_methods=["POST"])])
+def test_client_that_retries_itself_still_runs(clock: FakeClock, retries: Any) -> None:
+    client = make_client(clock, {"a": [[SUCCEEDED]]})
+    client.retries = retries
+
+    outcomes = run_jobs(client, [job("a")])
+
+    assert [o.status for o in outcomes] == ["captured"]
+    assert client.retries is retries
+
+
+def test_retrying_client_is_copied_without_retries() -> None:
+    original = CodeOcean(domain="https://codeocean.example", token="x", retries=Retry(total=5))
+
+    copy = runner._without_transport_retries(original)
+
+    assert copy is not original and copy.session is not original.session
+    assert (copy.retries, copy.domain, copy.token) == (0, original.domain, original.token)
+    assert isinstance(original.retries, Retry)
+
+
+def test_non_retrying_client_is_used_as_is() -> None:
+    client = CodeOcean(domain="https://codeocean.example", token="x")
+
+    assert runner._without_transport_retries(client) is client
 
 
 def test_invalid_key_is_rejected() -> None:

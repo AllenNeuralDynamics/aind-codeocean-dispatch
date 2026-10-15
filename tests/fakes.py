@@ -166,3 +166,4 @@ class FakeDataAssets:
 class FakeClient:
     computations: FakeComputations
     data_assets: FakeDataAssets
+    retries: Any = 0

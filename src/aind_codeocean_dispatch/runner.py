@@ -6,7 +6,9 @@ counters rather than locks, and no thread is parked per job.
 
 Error policy
 ------------
-The SDK's client retries nothing by default, so every 429 or 5xx surfaces here.
+Every 429 or 5xx must surface here, so :func:`run_jobs` works on a copy of the
+client with ``retries=0``: transport-level retries would resend POSTs below this
+policy, and their exhausted retries raise without the status code it reads.
 
 - **429** is retried on every call, honouring ``Retry-After``: the server rejected
   the request without acting on it.
@@ -232,7 +234,8 @@ def run_jobs(
     Parameters
     ----------
     client : CodeOcean
-        Authenticated client.
+        Authenticated client. Its own ``retries`` setting is overridden on a copy;
+        the caller's client is left unchanged.
     jobs : Sequence[Job]
         Launched in order, subject to the cap and pacing.
     max_in_flight : int, optional
@@ -271,7 +274,7 @@ def run_jobs(
     """
     _validate(jobs, max_in_flight=max_in_flight, start_retries=start_retries, capture_retries=capture_retries)
     return _Dispatcher(
-        client,
+        _without_transport_retries(client),
         jobs,
         max_in_flight=max_in_flight,
         launch_interval_s=launch_interval_s,
@@ -282,6 +285,18 @@ def run_jobs(
         poll_interval_s=poll_interval_s,
         timeout_s=timeout_s,
     ).run()
+
+
+def _without_transport_retries(client: CodeOcean) -> CodeOcean:
+    """Return *client*, or a copy with ``retries=0`` if it retries requests itself.
+
+    The copy opens a new session, so anything mounted on the original's ``session``
+    by hand is not carried over.
+    """
+    if client.retries in (0, None):
+        return client
+    logger.info("using a copy of the client with retries=0 (was %r); run_jobs retries what is safe", client.retries)
+    return dataclasses.replace(client, retries=0)
 
 
 def _validate(jobs: Sequence[Job], *, max_in_flight: int | None, start_retries: int, capture_retries: int) -> None:
