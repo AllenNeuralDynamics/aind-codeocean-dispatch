@@ -129,6 +129,29 @@ def test_failed_start_beyond_retries_fails_with_every_attempt(clock: FakeClock) 
     assert "has_results=False" in (outcome.error or "")
 
 
+def test_failed_starts_back_off_and_hold_other_launches(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[FAILED_START], [FAILED_START], [SUCCEEDED]], "b": [[SUCCEEDED]]})
+
+    outcomes = run_jobs(client, [job("a"), job("b")], start_retries=2, start_retry_backoff_s=60, poll_interval_s=5)
+
+    assert [o.status for o in outcomes] == ["captured", "captured"]
+    a_launches = [t for t, capsule, _ in client.computations.launches if capsule == "a"]
+    # Relaunches wait 60 s, then 120 s, after each failed start is seen.
+    assert a_launches[1] - a_launches[0] >= 60
+    assert a_launches[2] - a_launches[1] >= 120
+    assert len(client.computations.launches) == 4
+
+
+def test_failed_start_holds_a_launch_still_pending(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[FAILED_START], [SUCCEEDED]], "b": [[SUCCEEDED]]})
+
+    run_jobs(client, [job("a"), job("b")], max_in_flight=1, start_retry_backoff_s=60, poll_interval_s=5)
+
+    first_a = client.computations.launches[0][0]
+    (b_launch,) = [t for t, capsule, _ in client.computations.launches if capsule == "b"]
+    assert b_launch - first_a >= 60
+
+
 def test_start_retries_zero_disables_relaunch(clock: FakeClock) -> None:
     client = make_client(clock, {"a": [[FAILED_START]]})
 

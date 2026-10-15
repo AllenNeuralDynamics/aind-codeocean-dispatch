@@ -223,6 +223,7 @@ def run_jobs(
     max_in_flight: int | None = None,
     launch_interval_s: float = 0.0,
     start_retries: int = 1,
+    start_retry_backoff_s: float = 60.0,
     is_failed_start: Callable[[Computation], bool] = failed_without_results,
     capture_retries: int = 0,
     reuse: bool = False,
@@ -248,6 +249,10 @@ def run_jobs(
         regardless; this only spreads the burst.
     start_retries : int, optional
         Relaunches allowed per job when *is_failed_start* matches.
+    start_retry_backoff_s : float, optional
+        Wait before the first relaunch, doubling for each later one. Every pending
+        launch is held too: a start failure usually means machine capacity ran out,
+        and the runs holding it will not free it at once.
     is_failed_start : callable, optional
         Classifies a failed computation as a platform start failure.
     capture_retries : int, optional
@@ -275,13 +280,20 @@ def run_jobs(
         When a shutdown signal arrives (handlers installed by the caller, see
         :func:`aind_code_ocean_pipeline_utils.process.install_shutdown_handlers`).
     """
-    _validate(jobs, max_in_flight=max_in_flight, start_retries=start_retries, capture_retries=capture_retries)
+    _validate(
+        jobs,
+        max_in_flight=max_in_flight,
+        start_retries=start_retries,
+        start_retry_backoff_s=start_retry_backoff_s,
+        capture_retries=capture_retries,
+    )
     return _Dispatcher(
         _without_transport_retries(client),
         jobs,
         max_in_flight=max_in_flight,
         launch_interval_s=launch_interval_s,
         start_retries=start_retries,
+        start_retry_backoff_s=start_retry_backoff_s,
         is_failed_start=is_failed_start,
         capture_retries=capture_retries,
         reuse=reuse,
@@ -302,7 +314,14 @@ def _without_transport_retries(client: CodeOcean) -> CodeOcean:
     return dataclasses.replace(client, retries=0)
 
 
-def _validate(jobs: Sequence[Job], *, max_in_flight: int | None, start_retries: int, capture_retries: int) -> None:
+def _validate(
+    jobs: Sequence[Job],
+    *,
+    max_in_flight: int | None,
+    start_retries: int,
+    start_retry_backoff_s: float,
+    capture_retries: int,
+) -> None:
     labels = [job.label for job in jobs]
     if len(set(labels)) != len(labels):
         raise ValueError(f"job labels must be unique: {sorted(labels)}")
@@ -311,8 +330,8 @@ def _validate(jobs: Sequence[Job], *, max_in_flight: int | None, start_retries: 
         raise ValueError("job keys must be unique within a batch")
     if max_in_flight is not None and max_in_flight < 1:
         raise ValueError(f"max_in_flight must be at least 1, got {max_in_flight}")
-    if start_retries < 0 or capture_retries < 0:
-        raise ValueError("retry counts cannot be negative")
+    if start_retries < 0 or capture_retries < 0 or start_retry_backoff_s < 0:
+        raise ValueError("retry counts and back-off cannot be negative")
 
 
 def _prune(value: Any) -> Any:
@@ -392,6 +411,7 @@ class _Dispatcher:
         max_in_flight: int | None,
         launch_interval_s: float,
         start_retries: int,
+        start_retry_backoff_s: float,
         is_failed_start: Callable[[Computation], bool],
         capture_retries: int,
         reuse: bool,
@@ -403,6 +423,7 @@ class _Dispatcher:
         self.max_in_flight = max_in_flight
         self.launch_interval_s = launch_interval_s
         self.start_retries = start_retries
+        self.start_retry_backoff_s = start_retry_backoff_s
         self.is_failed_start = is_failed_start
         self.capture_retries = capture_retries
         self.reuse = reuse
@@ -568,8 +589,10 @@ class _Dispatcher:
         elif self.is_failed_start(computation) and slot.start_retries_used < self.start_retries:
             slot.start_retries_used += 1
             slot.phase = _Phase.PENDING
-            slot.next_at = _now()
-            logger.warning("%s: %s; relaunching", slot.job.label, _describe(computation))
+            backoff_s = self.start_retry_backoff_s * 2 ** (slot.start_retries_used - 1)
+            slot.next_at = _now() + backoff_s
+            self.next_launch_at = max(self.next_launch_at, slot.next_at)
+            logger.warning("%s: %s; relaunching in %.0f s", slot.job.label, _describe(computation), backoff_s)
         else:
             self._finish(slot, "failed", error=_describe(computation))
 
