@@ -2,6 +2,7 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
+from .automation import capture_finished_run, read_only_retries
 from .capsule_git import capsule_head_commit, head_commit, run_owner_email
 from .capture import capture_as, capture_named_by_data_description, derived_name
 from .runner import (
@@ -28,6 +29,7 @@ __all__ = [
     "Outcome",
     "capsule_head_commit",
     "capture_as",
+    "capture_finished_run",
     "capture_named_by_data_description",
     "derived_name",
     "failed_without_results",
@@ -35,6 +37,7 @@ __all__ = [
     "job_key",
     "key_tag",
     "raise_for_failures",
+    "read_only_retries",
     "run_jobs",
     "run_owner_email",
     "succeeded",

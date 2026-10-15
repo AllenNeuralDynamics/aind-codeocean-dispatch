@@ -31,6 +31,23 @@ To develop the code, run:
 uv sync
 ```
 
+## Capturing runs from a post-run automation
+
+A Code Ocean pipeline can name an automation capsule that runs after every run. A capsule
+whose `code/run` is
+
+```bash
+#!/usr/bin/env bash
+set -e
+python -m aind_codeocean_dispatch.automation
+```
+
+captures each successful run as an internal data asset, named by the results'
+`data_description.json` when it declares a derived name and otherwise after the first
+input asset. It needs only `CODEOCEAN_TOKEN`; `CAPTURE_TAGS`, `CAPTURE_FAILED` and
+`CAPTURE_PERMISSIONS` adjust it. It registers nothing in DocDB and writes no external
+bucket, so pipelines that publish use `asset-creation-capsule` instead.
+
 ## Development
 
 Please test your changes using the full linting and testing suite:
