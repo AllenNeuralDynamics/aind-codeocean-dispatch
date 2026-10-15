@@ -82,6 +82,11 @@ show_error_codes = true
 exclude = ["scratch"]
 
 [[tool.mypy.overrides]]
+# The SDK ships no py.typed marker.
+module = "codeocean.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
