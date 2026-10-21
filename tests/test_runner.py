@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import pytest
@@ -15,7 +16,9 @@ from aind_codeocean_dispatch import (
     DispatchFailed,
     DispatchInterrupted,
     Job,
+    Outcome,
     job_key,
+    key_marker,
     key_tag,
     raise_for_failures,
     run_jobs,
@@ -392,6 +395,198 @@ def test_reuse_off_never_searches(clock: FakeClock) -> None:
 
     assert outcome.status == "captured"
     assert client.data_assets.searches == []
+
+
+# -- on_outcome -------------------------------------------------------------------
+
+
+def test_on_outcome_sees_each_job_as_it_finishes(clock: FakeClock) -> None:
+    existing = [asset("old", DataAssetState.Ready, tags=[key_tag("k1")])]
+    client = make_client(clock, {"slow": [[RUNNING] * 5 + [SUCCEEDED]], "crash": [[CRASHED]]}, existing=existing)
+    seen: list[tuple[Outcome, float]] = []
+
+    outcomes = run_jobs(
+        client,
+        [job("slow"), job("crash"), job("cached", key="k1")],
+        reuse=True,
+        poll_interval_s=10,
+        on_outcome=lambda outcome: seen.append((outcome, clock.t)),
+    )
+
+    assert [(o.job.label, o.status) for o, _ in seen] == [
+        ("cached", "reused"),
+        ("crash", "failed"),
+        ("slow", "captured"),
+    ]
+    # Each is reported when reached, not when the batch ends.
+    assert seen[1][1] < seen[2][1]
+    assert sorted((o for o, _ in seen), key=lambda o: o.job.label) == sorted(outcomes, key=lambda o: o.job.label)
+
+
+def test_on_outcome_sees_cancelled_jobs(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[CRASHED]], "b": [[RUNNING]]})
+    seen: list[Outcome] = []
+
+    run_jobs(client, [job("a"), job("b")], cancel_on_failure=True, on_outcome=seen.append)
+
+    assert [(o.job.label, o.status) for o in seen] == [("a", "failed"), ("b", "cancelled")]
+
+
+def test_on_outcome_error_does_not_affect_the_batch(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[SUCCEEDED]], "b": [[RUNNING, SUCCEEDED]]})
+
+    def broken(outcome: Outcome) -> None:
+        raise RuntimeError("hook")
+
+    outcomes = run_jobs(client, [job("a"), job("b")], on_outcome=broken)
+
+    assert [o.status for o in outcomes] == ["captured", "captured"]
+
+
+# -- resume -------------------------------------------------------------------------
+
+
+def test_keyed_computations_are_named_for_resume(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[SUCCEEDED]], "b": [[SUCCEEDED]]})
+
+    run_jobs(client, [job("a", key="k1"), job("b")])
+
+    assert client.computations.names == {"comp-0": f"a {key_marker('k1')}"}
+
+
+def test_failed_naming_is_tried_again(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[RUNNING, RUNNING, SUCCEEDED]]})
+    client.computations.rename_errors = [http_error(429)]
+
+    (outcome,) = run_jobs(client, [job("a", key="k1")])
+
+    assert outcome.status == "captured"
+    assert client.computations.names["comp-0"] == f"a {key_marker('k1')}"
+
+
+def test_resume_follows_the_owners_running_computation(clock: FakeClock) -> None:
+    client = make_client(clock, {})
+    client.computations.existing("a", "earlier", [RUNNING, SUCCEEDED], name=f"a {key_marker('k1')}")
+
+    (outcome,) = run_jobs(client, [job("a", key="k1")], resume_owner="me")
+
+    assert (outcome.status, outcome.resumed, outcome.computation_ids) == ("captured", True, ("earlier",))
+    assert client.computations.launches == []
+
+
+def test_resume_matches_the_owner_by_email(clock: FakeClock) -> None:
+    client = make_client(clock, {})
+    client.computations.existing("a", "earlier", [SUCCEEDED], name=f"a {key_marker('k1')}", owner="me@x.org")
+
+    (outcome,) = run_jobs(client, [job("a", key="k1")], resume_owner="me@x.org")
+
+    assert outcome.resumed
+
+
+def test_resume_ignores_other_owners_failed_runs_and_other_keys(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[SUCCEEDED]]})
+    client.computations.existing("a", "theirs", [RUNNING], name=f"a {key_marker('k1')}", owner="someone")
+    client.computations.existing("a", "failed", [CRASHED], name=f"a {key_marker('k1')}")
+    client.computations.existing("a", "longer", [RUNNING], name=f"a {key_marker('k10')}")
+
+    (outcome,) = run_jobs(client, [job("a", key="k1")], resume_owner="me")
+
+    assert (outcome.status, outcome.resumed, outcome.computation_ids) == ("captured", False, ("comp-0",))
+
+
+def test_resume_prefers_a_live_computation_to_a_finished_one(clock: FakeClock) -> None:
+    client = make_client(clock, {})
+    marker = key_marker("k1")
+    client.computations.existing("a", "done", [SUCCEEDED], name=f"a {marker}", created=5)
+    client.computations.existing("a", "live", [RUNNING, SUCCEEDED], name=f"a {marker}", created=1)
+
+    (outcome,) = run_jobs(client, [job("a", key="k1")], resume_owner="me")
+
+    assert outcome.computation_ids == ("live",)
+
+
+def test_resume_captures_a_succeeded_uncaptured_computation(clock: FakeClock) -> None:
+    client = make_client(clock, {})
+    client.computations.existing("a", "earlier", [SUCCEEDED], name=f"a {key_marker('k1')}")
+
+    (outcome,) = run_jobs(client, [job("a", key="k1")], resume_owner="me")
+
+    assert (outcome.status, outcome.resumed) == ("captured", True)
+    assert [p.name for p in client.data_assets.created] == ["a-earlier"]
+
+
+def test_resume_does_not_capture_a_succeeded_computation_again(clock: FakeClock) -> None:
+    existing = [asset("old", DataAssetState.Ready, tags=[key_tag("k1")])]
+    client = make_client(clock, {"a": [[SUCCEEDED]]}, existing=existing)
+    client.computations.existing("a", "earlier", [SUCCEEDED], name=f"a {key_marker('k1')}")
+
+    (outcome,) = run_jobs(client, [job("a", key="k1")], resume_owner="me")
+
+    assert (outcome.status, outcome.resumed, outcome.computation_ids) == ("captured", False, ("comp-0",))
+
+
+def test_resume_waits_on_a_capture_in_progress(clock: FakeClock) -> None:
+    client = make_client(clock, {}, existing=[asset("capturing", DataAssetState.Draft, tags=[key_tag("k1")])])
+    client.data_assets._scripts["capturing"] = [DataAssetState.Draft, DataAssetState.Ready]
+
+    (outcome,) = run_jobs(client, [job("a", key="k1")], resume_owner="me")
+
+    assert (outcome.status, outcome.asset_id, outcome.resumed) == ("captured", "capturing", True)
+    assert client.computations.launches == []
+    assert client.data_assets.created == []
+
+
+def test_resume_lists_each_capsule_once(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[SUCCEEDED], [SUCCEEDED]]})
+    jobs = [Job(label, RunParams(capsule_id="a"), capture=capture_as(label), key=label) for label in ("x", "y")]
+
+    run_jobs(client, jobs, resume_owner="me")
+
+    assert client.computations.listings == ["a"]
+
+
+def test_resume_lists_a_pipelines_computations(clock: FakeClock) -> None:
+    client = make_client(clock, {})
+    client.computations.existing("p", "earlier", [SUCCEEDED], name=f"p {key_marker('k1')}")
+
+    (outcome,) = run_jobs(
+        client, [Job("p", RunParams(pipeline_id="p"), capture=capture_as("p"), key="k1")], resume_owner="me"
+    )
+
+    assert outcome.computation_ids == ("earlier",)
+
+
+def test_rate_limited_listing_is_retried(clock: FakeClock) -> None:
+    client = make_client(clock, {})
+    client.computations.existing("a", "earlier", [SUCCEEDED], name=f"a {key_marker('k1')}")
+    client.computations.list_errors = [http_error(429)]
+
+    (outcome,) = run_jobs(client, [job("a", key="k1")], resume_owner="me")
+
+    assert outcome.resumed
+    assert client.computations.listings == ["a", "a"]
+
+
+def test_failed_listing_falls_back_to_launching(clock: FakeClock) -> None:
+    client = make_client(clock, {"a": [[SUCCEEDED]]})
+    client.computations.list_errors = [http_error(403)]
+
+    (outcome,) = run_jobs(client, [job("a", key="k1")], resume_owner="me")
+
+    assert (outcome.status, outcome.resumed) == ("captured", False)
+
+
+def test_resume_needs_an_sdk_whose_computations_carry_an_owner(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @dataclasses.dataclass
+    class OldComputation:
+        id: str
+
+    monkeypatch.setattr(runner, "Computation", OldComputation)
+
+    with pytest.raises(ValueError, match="0.15"):
+        run_jobs(make_client(clock, {}), [job("a", key="k1")], resume_owner="me")
 
 
 # -- interruption and misuse --------------------------------------------------

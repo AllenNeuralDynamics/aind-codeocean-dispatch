@@ -18,7 +18,8 @@ policy, and their exhausted retries raise without the status code it reads.
 - **Any other HTTP error** fails the job.
 
 Policy beyond that -- concurrency cap, launch pacing, relaunching failed starts,
-retrying failed captures, reusing captured results -- is opt-in.
+retrying failed captures, reusing captured results, resuming computations a
+previous batch left running -- is opt-in.
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ __all__ = [
     "Outcome",
     "failed_without_results",
     "job_key",
+    "key_marker",
     "key_tag",
     "raise_for_failures",
     "run_jobs",
@@ -104,8 +106,10 @@ class Job:
         can depend on it. ``None`` stops at a successful computation.
     key : str, optional
         Resume key (see :func:`job_key`), added to the captured asset as
-        :func:`key_tag`. With ``reuse=True``, a Ready asset carrying it that the
-        caller created is returned instead of launching. ``None`` never reuses.
+        :func:`key_tag` and to the computation's name as :func:`key_marker`. With
+        ``reuse=True``, a Ready asset carrying it that the caller created is
+        returned instead of launching; with ``resume_owner``, the caller's
+        computation carrying it is followed instead. ``None`` does neither.
     """
 
     label: str
@@ -124,8 +128,9 @@ class Outcome:
     """How one job ended.
 
     ``computation_ids`` lists every launch attempt in order, so a relaunched job's
-    failed starts stay traceable. ``failure`` is set only when ``status`` is
-    ``"failed"``.
+    failed starts stay traceable; ``resumed`` says the first of them was found
+    running, or finished, rather than launched by this batch. ``failure`` is set
+    only when ``status`` is ``"failed"``.
     """
 
     job: Job
@@ -134,6 +139,7 @@ class Outcome:
     computation_ids: tuple[str, ...] = ()
     error: str | None = None
     failure: Failure | None = None
+    resumed: bool = False
 
     @property
     def ok(self) -> bool:
@@ -203,6 +209,11 @@ def key_tag(key: str) -> str:
     return f"{_KEY_TAG_PREFIX}{key}"
 
 
+def key_marker(key: str) -> str:
+    """Return the text a computation's name carries to be found again by resume *key*."""
+    return f"[{key_tag(key)}]"
+
+
 def job_key(run_params: RunParams, *, salt: str = "") -> str:
     """Return a resume key: 16 hex characters fingerprinting *run_params*.
 
@@ -247,6 +258,8 @@ def run_jobs(
     poll_interval_s: float = 60.0,
     timeout_s: float | None = None,
     cancel_on_failure: bool | Callable[[Outcome], bool] = False,
+    resume_owner: str | None = None,
+    on_outcome: Callable[[Outcome], None] | None = None,
 ) -> list[Outcome]:
     """Launch *jobs*, wait for each, capture its results, and report every outcome.
 
@@ -288,6 +301,17 @@ def run_jobs(
         Whether a failed job cancels the rest, or a predicate on its outcome. On
         cancel, pending jobs are not launched and running computations are stopped
         and deleted, all ending ``"cancelled"``; captures already under way finish.
+    resume_owner : str, optional
+        The caller's Code Ocean user id or email. When set, a keyed job whose
+        computation this owner launched earlier, and which is still running or
+        succeeded uncaptured, is followed from there instead of launched again; a
+        capture of it still in progress is waited on. Code Ocean lists every
+        user's computations and has no call naming the caller, hence the
+        argument. Needs codeocean 0.15 or later, whose computations carry an owner.
+    on_outcome : callable, optional
+        Called with each job's outcome as soon as it is reached, whatever the
+        status, so results can be used before the batch ends. An exception it
+        raises is logged and does not affect the batch.
 
     Returns
     -------
@@ -308,6 +332,7 @@ def run_jobs(
         start_retries=start_retries,
         start_retry_backoff_s=start_retry_backoff_s,
         capture_retries=capture_retries,
+        resume_owner=resume_owner,
     )
     return _Dispatcher(
         _without_transport_retries(client),
@@ -322,6 +347,8 @@ def run_jobs(
         poll_interval_s=poll_interval_s,
         timeout_s=timeout_s,
         cancel_on_failure=cancel_on_failure,
+        resume_owner=resume_owner,
+        on_outcome=on_outcome,
     ).run()
 
 
@@ -344,6 +371,7 @@ def _validate(
     start_retries: int,
     start_retry_backoff_s: float,
     capture_retries: int,
+    resume_owner: str | None,
 ) -> None:
     labels = [job.label for job in jobs]
     if len(set(labels)) != len(labels):
@@ -355,6 +383,8 @@ def _validate(
         raise ValueError(f"max_in_flight must be at least 1, got {max_in_flight}")
     if start_retries < 0 or capture_retries < 0 or start_retry_backoff_s < 0:
         raise ValueError("retry counts and back-off cannot be negative")
+    if resume_owner is not None and "owner" not in {f.name for f in dataclasses.fields(Computation)}:
+        raise ValueError("resume_owner needs codeocean 0.15 or later, whose computations carry an owner")
 
 
 def _prune(value: Any) -> Any:
@@ -422,6 +452,9 @@ class _Slot:
     start_retries_used: int = 0
     capture_retries_used: int = 0
     reuse_checked: bool = False
+    # Whether the current computation's name carries the key marker yet.
+    marked: bool = True
+    resumed: bool = False
     outcome: Outcome | None = None
 
 
@@ -441,6 +474,8 @@ class _Dispatcher:
         poll_interval_s: float,
         timeout_s: float | None,
         cancel_on_failure: bool | Callable[[Outcome], bool],
+        resume_owner: str | None,
+        on_outcome: Callable[[Outcome], None] | None,
     ) -> None:
         self.client = client
         self.slots = [_Slot(job) for job in jobs]
@@ -454,6 +489,10 @@ class _Dispatcher:
         self.poll_interval_s = poll_interval_s
         self.timeout_s = timeout_s
         self.cancel_on_failure = cancel_on_failure
+        self.resume_owner = resume_owner
+        self.on_outcome = on_outcome
+        # Per capsule or pipeline id: its computations carrying a key marker, by key.
+        self.resumable: dict[str, dict[str, list[Computation]]] = {}
         self.cancelled_by: str | None = None
         self.next_launch_at = 0.0
 
@@ -485,8 +524,8 @@ class _Dispatcher:
         for slot in self.slots:
             if slot.phase is not _Phase.PENDING or slot.next_at > _now():
                 continue
-            if self.reuse and slot.job.key is not None and not slot.reuse_checked:
-                continue  # still waiting on its reuse search
+            if self._searches_first() and slot.job.key is not None and not slot.reuse_checked:
+                continue  # still waiting on its reuse or resume search
             if self.max_in_flight is not None and self._in_flight() >= self.max_in_flight:
                 return
             if _now() < self.next_launch_at:
@@ -512,11 +551,18 @@ class _Dispatcher:
             computation_ids=tuple(slot.computation_ids),
             error=error,
             failure=failure,
+            resumed=slot.resumed,
         )
         if error is None:
             logger.info("%s: %s", slot.job.label, status)
         else:
             logger.error("%s: %s: %s", slot.job.label, status, error)
+        if self.on_outcome is not None:
+            try:
+                self.on_outcome(slot.outcome)
+            # Broad on purpose: the caller's hook must not orphan the other jobs' computations.
+            except Exception:
+                logger.exception("%s: on_outcome raised", slot.job.label)
         if status == "failed" and self.cancelled_by is None and self._should_cancel(slot.outcome):
             self._cancel_rest(slot.job.label)
 
@@ -571,9 +617,12 @@ class _Dispatcher:
 
     # -- phases -------------------------------------------------------------
 
+    def _searches_first(self) -> bool:
+        return self.reuse or self.resume_owner is not None
+
     def _check_reuse(self) -> None:
-        """Resolve pending keyed jobs to existing captures, without using launch capacity."""
-        if not self.reuse:
+        """Resolve pending keyed jobs to existing captures or computations, without using launch capacity."""
+        if not self._searches_first():
             return
         for slot in self.slots:
             if slot.phase is not _Phase.PENDING or slot.reuse_checked or slot.job.key is None:
@@ -590,20 +639,92 @@ class _Dispatcher:
                     slot.api_errors += 1
                     slot.next_at = _now() + delay
                     continue
-                # Reuse is an optimisation: launching is still correct.
+                # Reuse and resume are optimisations: launching is still correct.
                 logger.warning("%s: reuse search failed (%s); launching", slot.job.label, exc)
                 slot.reuse_checked = True
                 continue
             slot.api_errors = 0
-            slot.reuse_checked = True
             # Tag search may tokenize, so confirm the exact tag client-side.
-            matches: list[DataAsset] = [
-                asset for asset in results.results if asset.state == DataAssetState.Ready and tag in (asset.tags or [])
-            ]
-            if matches:
-                slot.asset_id = max(matches, key=lambda asset: asset.created).id
+            tagged: list[DataAsset] = [asset for asset in results.results if tag in (asset.tags or [])]
+            ready = [asset for asset in tagged if asset.state == DataAssetState.Ready]
+            capturing = [asset for asset in tagged if asset.state not in (DataAssetState.Ready, DataAssetState.Failed)]
+            if self.reuse and ready:
+                slot.reuse_checked = True
+                slot.asset_id = max(ready, key=lambda asset: asset.created).id
                 logger.info("%s: reusing captured asset %s", slot.job.label, slot.asset_id)
                 self._finish(slot, "reused")
+            elif self.resume_owner is not None and capturing:
+                slot.reuse_checked = True
+                slot.asset_id = max(capturing, key=lambda asset: asset.created).id
+                slot.resumed = True
+                slot.phase = _Phase.CAPTURING
+                slot.next_at = _now()
+                logger.info("%s: resuming capture %s", slot.job.label, slot.asset_id)
+            elif self.resume_owner is not None:
+                # A succeeded computation already captured is not resumed: with reuse
+                # off, the caller asked for a new run, not a second capture.
+                self._resume_computation(slot, finished_too=not ready)
+            else:
+                slot.reuse_checked = True
+
+    def _resume_computation(self, slot: _Slot, *, finished_too: bool) -> None:
+        """Follow the owner's running, or else succeeded, computation of *slot*'s job, if there is one."""
+        assert slot.job.key is not None
+        source = slot.job.run_params.capsule_id or slot.job.run_params.pipeline_id
+        if source is None:
+            slot.reuse_checked = True
+            return
+        if source not in self.resumable:
+            listing = self._list_resumable(slot, source)
+            if listing is None:
+                return  # retrying, or done
+            self.resumable[source] = listing
+        slot.reuse_checked = True
+        candidates = self.resumable[source].get(slot.job.key, [])
+        live = [c for c in candidates if c.state not in (ComputationState.Completed, ComputationState.Failed)]
+        done = [c for c in candidates if succeeded(c)] if finished_too else []
+        if not (live or done):
+            return
+        # A live computation is newer than any finished one worth resuming.
+        computation = max(live or done, key=lambda c: c.created)
+        slot.computation_ids.append(computation.id)
+        slot.resumed = True
+        slot.phase = _Phase.RUNNING
+        # Timeouts count from here: how long it ran before is unknown to this batch.
+        slot.launched_at = _now()
+        slot.next_at = _now()
+        logger.info("%s: resuming computation %s (%s)", slot.job.label, computation.id, computation.state)
+
+    def _list_resumable(self, slot: _Slot, source: str) -> dict[str, list[Computation]] | None:
+        """Index the owner's computations of *source* by the key their name carries."""
+        lister = (
+            self.client.capsules.list_computations
+            if slot.job.run_params.capsule_id
+            else self.client.pipelines.list_computations
+        )
+        try:
+            computations = lister(source)
+        except (CodeOceanError, requests.RequestException) as exc:
+            delay = _retry_delay(exc, slot.api_errors, idempotent=True)
+            if delay is not None:
+                slot.api_errors += 1
+                slot.next_at = _now() + delay
+                return None
+            logger.warning("%s: listing computations of %s failed (%s); launching", slot.job.label, source, exc)
+            return {}
+        slot.api_errors = 0
+        keys = {job.key for job in (s.job for s in self.slots) if job.key is not None}
+        index: dict[str, list[Computation]] = {}
+        for computation in computations:
+            if self.resume_owner not in (
+                getattr(computation, "owner", None),
+                getattr(computation, "owner_email", None),
+            ):
+                continue
+            for key in keys:
+                if key_marker(key) in (computation.name or ""):
+                    index.setdefault(key, []).append(computation)
+        return index
 
     def _launch(self, slot: _Slot) -> None:
         computation = self._call(
@@ -620,8 +741,29 @@ class _Dispatcher:
         slot.next_at = slot.launched_at + self.poll_interval_s
         self.next_launch_at = slot.launched_at + self.launch_interval_s
         logger.info("%s: launched %s (attempt %d)", slot.job.label, computation.id, len(slot.computation_ids))
+        slot.marked = slot.job.key is None
+        if not slot.marked:
+            self._mark(slot)
+
+    def _mark(self, slot: _Slot) -> None:
+        """Name the computation after its job and key, so a later batch can resume it.
+
+        Best effort: until it succeeds, each status check tries again, and a
+        computation left unnamed is relaunched rather than resumed.
+        """
+        assert slot.job.key is not None
+        computation_id = slot.computation_ids[-1]
+        name = f"{slot.job.label} {key_marker(slot.job.key)}"
+        try:
+            self.client.computations.rename_computation(computation_id, name)
+        except (CodeOceanError, requests.RequestException) as exc:
+            logger.warning("%s: naming computation %s failed (%s); trying again", slot.job.label, computation_id, exc)
+            return
+        slot.marked = True
 
     def _poll_computation(self, slot: _Slot) -> None:
+        if not slot.marked:
+            self._mark(slot)
         computation_id = slot.computation_ids[-1]
         computation = self._call(
             slot, "status check", lambda: self.client.computations.get_computation(computation_id), idempotent=True

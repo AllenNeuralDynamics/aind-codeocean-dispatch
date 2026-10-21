@@ -80,6 +80,18 @@ Behaviour worth knowing:
   the launch request; pass `salt=` for what the request cannot show, such as the commit
   of an unreleased capsule (`capsule_head_commit(client, capsule_id)` reads it inside a
   run).
+- **Acting on each job as it finishes.** `on_outcome=` is called with each job's
+  `Outcome` as soon as it is reached, whatever its status, so a caller can register or
+  report results without waiting for the whole batch. An exception it raises is logged
+  and does not affect the other jobs.
+- **Resuming a batch.** A keyed job's computation is renamed to its label plus
+  `key_marker(key)`. With `resume_owner=` set to your Code Ocean user id or email, a
+  later batch follows your computation of the same job instead of launching it again:
+  one still running is waited on, one that succeeded but was never captured is
+  captured, and a capture still in progress is waited on. A succeeded computation that
+  already has a Ready capture is resumed only through `reuse`. Code Ocean lists every
+  user's computations of a capsule and has no call naming the caller, hence the
+  argument; it needs codeocean 0.15 or later.
 - **Cancelling a doomed batch.** `cancel_on_failure=True`, or a predicate on the failed
   `Outcome` such as `lambda o: not o.transient`, stops launching and stops and deletes
   running computations; captures already under way finish.

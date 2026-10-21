@@ -3,7 +3,8 @@
 Each launch of a capsule consumes the next *attempt* scripted for its ``capsule_id``:
 a list of computation snapshots (or exceptions) returned by successive status checks,
 the last repeating. Captures and asset status checks are scripted the same way, in
-creation order.
+creation order. Computations a batch did not launch, for it to resume, are added with
+:meth:`FakeComputations.existing`.
 """
 
 from __future__ import annotations
@@ -106,9 +107,36 @@ class FakeComputations:
     max_running: int = 0
     deleted: list[str] = field(default_factory=list)
     delete_errors: list[Exception] = field(default_factory=list)
+    names: dict[str, str] = field(default_factory=dict)
+    rename_errors: list[Exception] = field(default_factory=list)
+    list_errors: list[Exception] = field(default_factory=list)
+    listings: list[str] = field(default_factory=list)
     _ids: itertools.count[int] = field(default_factory=itertools.count)
     _scripts: dict[str, list[Any]] = field(default_factory=dict)
     _running: set[str] = field(default_factory=set)
+    _listed: dict[str, list[tuple[str, str, int]]] = field(default_factory=dict)  # source -> (id, owner, created)
+
+    def existing(
+        self, source: str, computation_id: str, script: list[Any], *, name: str, owner: str = "me", created: int = 0
+    ) -> None:
+        """Add a computation launched before the batch, listed under *source*."""
+        self._scripts[computation_id] = list(script)
+        self.names[computation_id] = name
+        self._listed.setdefault(source, []).append((computation_id, owner, created))
+
+    def list_computations(self, source: str) -> list[Computation]:
+        self.listings.append(source)
+        if self.list_errors:
+            raise self.list_errors.pop(0)
+        return [
+            self._computation(computation_id, self._scripts[computation_id][0], owner=owner, created=created)
+            for computation_id, owner, created in self._listed.get(source, [])
+        ]
+
+    def rename_computation(self, computation_id: str, name: str) -> None:
+        if self.rename_errors:
+            raise self.rename_errors.pop(0)
+        self.names[computation_id] = name
 
     def run_capsule(self, run_params: RunParams) -> Computation:
         errors = self.launch_errors.get(run_params.capsule_id, [])
@@ -136,9 +164,11 @@ class FakeComputations:
             self._running.discard(computation_id)
         return self._computation(computation_id, step)
 
-    @staticmethod
-    def _computation(computation_id: str, step: dict[str, Any]) -> Computation:
-        return build(Computation, id=computation_id, created=0, name=computation_id, owner="owner", run_time=0, **step)
+    def _computation(
+        self, computation_id: str, step: dict[str, Any], *, owner: str = "me", created: int = 0
+    ) -> Computation:
+        name = self.names.get(computation_id, computation_id)
+        return build(Computation, id=computation_id, created=created, name=name, owner=owner, run_time=0, **step)
 
 
 @dataclass
@@ -175,7 +205,25 @@ class FakeDataAssets:
 
 
 @dataclass
+class FakeListing:
+    """``client.capsules`` or ``client.pipelines``: both list computations the same way."""
+
+    computations: FakeComputations
+
+    def list_computations(self, source_id: str) -> list[Computation]:
+        return self.computations.list_computations(source_id)
+
+
+@dataclass
 class FakeClient:
     computations: FakeComputations
     data_assets: FakeDataAssets
     retries: Any = 0
+
+    @property
+    def capsules(self) -> FakeListing:
+        return FakeListing(self.computations)
+
+    @property
+    def pipelines(self) -> FakeListing:
+        return FakeListing(self.computations)
